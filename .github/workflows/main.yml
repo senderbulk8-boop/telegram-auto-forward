@@ -24,7 +24,7 @@ jobs:
           python-version: "3.x"
 
       - name: Install deps
-        run: pip install requests
+        run: pip install requests pikepdf
 
       - name: Run bot
         env:
