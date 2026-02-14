@@ -7,6 +7,7 @@ FEED_URL = os.environ["FEED_URL"]
 FOLLOW_LINE = os.environ.get("FOLLOW_LINE", "📢 Follow @topgkguru")
 LAST_FILE = "last.txt"
 
+# remove any kinds of links
 URL_RE = re.compile(r"""(?ix)
 \b(
   https?://\S+ |
@@ -16,12 +17,13 @@ URL_RE = re.compile(r"""(?ix)
 )\b
 """)
 
-def tg_photo_upload(photo_bytes: bytes, caption: str):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    files = {"photo": ("image.jpg", photo_bytes)}
-    data = {"chat_id": DEST_CHANNEL, "caption": caption}
-    r = requests.post(url, data=data, files=files, timeout=120)
-    r.raise_for_status()
+# detect truncated endings like "[...]" or "..." or "…"
+TRUNC_END_RE = re.compile(r"""(?ix)
+(\s*\[\s*\.\.\.\s*\]\s*$) |
+(\s*\[\s*…\s*\]\s*$) |
+(\s*…\s*$) |
+(\s*\.\.\.\s*$)
+""")
 
 def tg_send_text(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -30,6 +32,13 @@ def tg_send_text(text: str):
         "text": text[:3900],
         "disable_web_page_preview": True
     }, timeout=60)
+    r.raise_for_status()
+
+def tg_send_photo_bytes(photo_bytes: bytes, caption: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    files = {"photo": ("image.jpg", photo_bytes)}
+    data = {"chat_id": DEST_CHANNEL, "caption": caption[:900]}
+    r = requests.post(url, data=data, files=files, timeout=120)
     r.raise_for_status()
 
 def read_last():
@@ -55,49 +64,15 @@ def remove_links(s: str) -> str:
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
-def remove_preview_boilerplate(s: str) -> str:
-    # Removes common platform preview junk (esp. YouTube)
-    lines = [ln.strip() for ln in s.splitlines()]
-    cleaned = []
-    for ln in lines:
-        low = ln.lower()
+def normalize(s: str) -> str:
+    s = TRUNC_END_RE.sub("", s).strip()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-        if not ln:
-            cleaned.append("")
-            continue
-
-        # platform header lines
-        if low in {"youtube", "instagram", "facebook", "twitter", "x", "telegram"}:
-            continue
-
-        # common youtube boilerplate text
-        if "enjoy the videos and music you love" in low:
-            continue
-        if "upload original content" in low:
-            continue
-        if "share it all with friends" in low:
-            continue
-        if "and the world on youtube" in low:
-            continue
-        if "on youtube" in low and len(ln) < 80:
-            continue
-
-        # glued "YouTubeTitle..." lines
-        if low.startswith("youtube") and len(ln) > 6:
-            # remove starting "YouTube" word if it's just a prefix
-            ln2 = re.sub(r"(?i)^youtube\s*", "", ln).strip()
-            if ln2:
-                cleaned.append(ln2)
-            continue
-
-        cleaned.append(ln)
-
-    out = "\n".join(cleaned)
-    out = re.sub(r"\n{3,}", "\n\n", out).strip()
-    return out
-
-def normalize_for_compare(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip()
+def remove_prefixes(s: str) -> str:
+    # remove [Photo] / [Media] prefix if exists
+    s = re.sub(r"^\[(?:Photo|Media)\]\s*", "", s, flags=re.I).strip()
+    return s
 
 def parse_first_item(xml: str):
     m_item = re.search(r"<item>(.*?)</item>", xml, flags=re.S)
@@ -109,55 +84,64 @@ def parse_first_item(xml: str):
         m = re.search(rf"<{tag}>(.*?)</{tag}>", item, flags=re.S)
         return (m.group(1).strip() if m else "")
 
+    # basic fields
     title_raw = re.sub(r"<!\[CDATA\[|\]\]>", "", pick("title"))
+    desc_raw = re.sub(r"<!\[CDATA\[|\]\]>", "", pick("description"))
     link = pick("link").strip()
     guid = (pick("guid").strip() or link)
 
-    desc_raw = re.sub(r"<!\[CDATA\[|\]\]>", "", pick("description"))
-    desc_html = html.unescape(desc_raw)
+    # enclosure (best for photos)
+    enc_url = None
+    enc_type = None
+    m_enc = re.search(r'enclosure[^>]+url="([^"]+)"[^>]+type="([^"]+)"', item, flags=re.I)
+    if m_enc:
+        enc_url = m_enc.group(1)
+        enc_type = m_enc.group(2)
 
-    # Extract image URL if present
-    img = None
-    m_href = re.search(r'<a[^>]+href="([^"]+\.(?:jpg|jpeg|png|webp))"', desc_html, flags=re.I)
-    if m_href:
-        img = m_href.group(1)
-    else:
-        m_img = re.search(r'<img[^>]+src="([^"]+)"', desc_html, flags=re.I)
-        if m_img:
-            img = m_img.group(1)
+    title = remove_prefixes(strip_tags(title_raw))
+    desc = strip_tags(desc_raw)
 
-    title = strip_tags(title_raw)
-    desc = strip_tags(desc_html)
-
-    # remove "[Photo]" noise
+    # remove "[Photo]" text inside description too
     desc = re.sub(r"^\[Photo\]\s*", "", desc).strip()
 
-    # Remove links
+    # remove links everywhere
     title = remove_links(title)
     desc = remove_links(desc)
 
-    # Remove preview boilerplate (YouTube etc.)
-    title = remove_preview_boilerplate(title)
-    desc = remove_preview_boilerplate(desc)
+    # --- DEDUPE FIX FOR YOUR FEED ---
+    # If title is truncated (ends with [...]/.../…), DO NOT include it at all.
+    title_is_truncated = bool(TRUNC_END_RE.search(title_raw)) or bool(TRUNC_END_RE.search(title))
+    t_norm = normalize(title)
+    d_norm = normalize(desc)
 
-    # ✅ DEDUPE title vs desc
-    t_norm = normalize_for_compare(title)
-    d_norm = normalize_for_compare(desc)
-
-    if t_norm and d_norm:
-        if d_norm == t_norm:
-            combined = desc
-        elif d_norm.startswith(t_norm):
-            combined = desc
-        elif t_norm.startswith(d_norm):
-            combined = title
-        else:
-            combined = f"{title}\n\n{desc}"
+    if title_is_truncated:
+        combined = desc
     else:
-        combined = title or desc
+        # If description already starts with title, drop title
+        # (your feed often repeats title inside description)
+        # Compare first line too
+        first_line = ""
+        for ln in desc.splitlines():
+            if ln.strip():
+                first_line = ln.strip()
+                break
+
+        f_norm = normalize(first_line)
+        if t_norm and f_norm and (f_norm == t_norm or f_norm.startswith(t_norm) or t_norm.startswith(f_norm)):
+            combined = desc
+        elif t_norm and d_norm and (d_norm == t_norm or d_norm.startswith(t_norm)):
+            combined = desc
+        else:
+            combined = f"{title}\n\n{desc}".strip() if title and desc else (title or desc)
 
     combined = re.sub(r"\n{3,}", "\n\n", combined).strip()
-    return {"guid": guid, "text": combined, "img": img}
+
+    return {
+        "guid": guid,
+        "text": combined,
+        "enclosure_url": enc_url,
+        "enclosure_type": enc_type
+    }
 
 def main():
     last = read_last()
@@ -174,11 +158,11 @@ def main():
     out = f"{item['text']}\n\n━━━━━━━━━━━━━━\n{FOLLOW_LINE}".strip()
     out = re.sub(r"\n{3,}", "\n\n", out).strip()
 
-    if item["img"]:
-        img_resp = requests.get(item["img"], timeout=120)
-        img_resp.raise_for_status()
-        cap = out[:900]  # safe under caption limit
-        tg_photo_upload(img_resp.content, cap)
+    # If image enclosure exists, send as real photo
+    if item["enclosure_url"] and item["enclosure_type"] and item["enclosure_type"].lower().startswith("image/"):
+        img = requests.get(item["enclosure_url"], timeout=120)
+        img.raise_for_status()
+        tg_send_photo_bytes(img.content, out)
     else:
         tg_send_text(out)
 
