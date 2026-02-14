@@ -1,5 +1,6 @@
-import os, re, html, time
+import os, re, html, time, io
 import requests
+import pikepdf
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DEST_CHANNEL = os.environ["DEST_CHANNEL"]
@@ -7,10 +8,13 @@ FEED_URL = os.environ["FEED_URL"]
 FOLLOW_LINE = os.environ.get("FOLLOW_LINE", "📢 Follow @topgkguru")
 LAST_FILE = "last.txt"
 
+# Remove any kinds of links from text
 URL_RE = re.compile(r"""(?ix)\b(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+)\b""")
 
+# Detect truncated title endings like "[...]" or "..." or "…"
 TRUNC_END_RE = re.compile(r"""(?ix)
 (\s*\[\s*\.\.\.\s*\]\s*$)|
+(\s*\[\s*…\s*\]\s*$)|
 (\s*…\s*$)|
 (\s*\.\.\.\s*$)
 """)
@@ -28,7 +32,14 @@ def tg_send_photo_bytes(photo_bytes: bytes, caption: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     files = {"photo": ("image.jpg", photo_bytes)}
     data = {"chat_id": DEST_CHANNEL, "caption": caption[:900]}
-    r = requests.post(url, data=data, files=files, timeout=120)
+    r = requests.post(url, data=data, files=files, timeout=180)
+    r.raise_for_status()
+
+def tg_send_document_bytes(doc_bytes: bytes, filename: str, caption: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+    files = {"document": (filename, doc_bytes, "application/pdf")}
+    data = {"chat_id": DEST_CHANNEL, "caption": caption[:900]}
+    r = requests.post(url, data=data, files=files, timeout=300)
     r.raise_for_status()
 
 def read_last():
@@ -60,7 +71,53 @@ def normalize(s: str) -> str:
     return s
 
 def remove_prefixes(s: str) -> str:
+    # remove [Photo] / [Media] prefix if exists
     return re.sub(r"^\[(?:Photo|Media)\]\s*", "", s, flags=re.I).strip()
+
+def sanitize_pdf_remove_links(pdf_bytes: bytes) -> bytes:
+    """
+    Remove clickable link annotations and URI/GoTo actions.
+    Does NOT remove URL text printed inside pages.
+    """
+    src = pikepdf.Pdf.open(io.BytesIO(pdf_bytes))
+
+    for page in src.pages:
+        annots = page.get("/Annots", None)
+        if not annots:
+            continue
+
+        new_annots = []
+        for a in annots:
+            try:
+                obj = a.get_object()
+            except Exception:
+                continue
+
+            # Remove actions/dests if present
+            if "/A" in obj:
+                del obj["/A"]
+            if "/AA" in obj:
+                del obj["/AA"]
+            if "/Dest" in obj:
+                del obj["/Dest"]
+
+            subtype = obj.get("/Subtype", None)
+
+            # Drop Link annotations completely (these create clickable areas)
+            if subtype == pikepdf.Name("/Link"):
+                continue
+
+            new_annots.append(a)
+
+        if new_annots:
+            page["/Annots"] = pikepdf.Array(new_annots)
+        else:
+            if "/Annots" in page:
+                del page["/Annots"]
+
+    out = io.BytesIO()
+    src.save(out)
+    return out.getvalue()
 
 def parse_item(item_xml: str):
     def pick(tag):
@@ -72,7 +129,7 @@ def parse_item(item_xml: str):
     link = pick("link").strip()
     guid = (pick("guid").strip() or link)
 
-    # enclosure for images
+    # enclosure for image/pdf
     enc_url = None
     enc_type = None
     m_enc = re.search(r'enclosure[^>]+url="([^"]+)"[^>]+type="([^"]+)"', item_xml, flags=re.I)
@@ -84,14 +141,14 @@ def parse_item(item_xml: str):
     desc = strip_tags(desc_raw)
     desc = re.sub(r"^\[Photo\]\s*", "", desc).strip()
 
+    # remove links from both
     title = remove_links(title)
     desc = remove_links(desc)
 
-    # DEDUPE (handles truncated title like [...])
+    # DEDUPE for your feed (title truncated with [...])
     title_is_truncated = bool(TRUNC_END_RE.search(title_raw)) or bool(TRUNC_END_RE.search(title))
     t_norm = normalize(title)
 
-    # first non-empty line of desc
     first_line = ""
     for ln in desc.splitlines():
         if ln.strip():
@@ -111,6 +168,7 @@ def parse_item(item_xml: str):
             combined = f"{title}\n\n{desc}".strip() if title and desc else (title or desc)
 
     combined = re.sub(r"\n{3,}", "\n\n", combined).strip()
+
     return {
         "guid": guid,
         "text": combined,
@@ -127,7 +185,7 @@ def parse_all_items(xml: str):
 def main():
     last_guid = read_last()
 
-    xml = requests.get(FEED_URL, timeout=60).text
+    xml = requests.get(FEED_URL, timeout=90).text
     items = parse_all_items(xml)
     if not items:
         print("No items found")
@@ -144,21 +202,30 @@ def main():
         print("No new posts")
         return
 
-    # Send oldest -> newest so ordering stays correct
+    # Send oldest -> newest (so order stays correct)
     new_items.reverse()
 
     for it in new_items:
         out = f"🔥 New Update\n\n{it['text']}\n\n━━━━━━━━━━━━━━\n{FOLLOW_LINE}".strip()
         out = re.sub(r"\n{3,}", "\n\n", out).strip()
 
-        if it["enclosure_url"] and it["enclosure_type"] and it["enclosure_type"].lower().startswith("image/"):
-            img = requests.get(it["enclosure_url"], timeout=120)
+        ctype = (it["enclosure_type"] or "").lower()
+
+        if it["enclosure_url"] and ctype.startswith("image/"):
+            img = requests.get(it["enclosure_url"], timeout=180)
             img.raise_for_status()
             tg_send_photo_bytes(img.content, out)
+
+        elif it["enclosure_url"] and ctype == "application/pdf":
+            pdf = requests.get(it["enclosure_url"], timeout=300)
+            pdf.raise_for_status()
+            safe_pdf = sanitize_pdf_remove_links(pdf.content)
+            tg_send_document_bytes(safe_pdf, "document.pdf", out)
+
         else:
             tg_send_text(out)
 
-        time.sleep(1)  # avoid Telegram rate limits
+        time.sleep(1)  # avoid rate-limits
 
     # Save newest guid as last processed
     write_last(new_items[-1]["guid"])
