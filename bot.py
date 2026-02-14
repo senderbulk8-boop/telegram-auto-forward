@@ -48,19 +48,56 @@ def strip_tags(s: str) -> str:
     return s.strip()
 
 def remove_links(s: str) -> str:
-    # remove urls
     s = URL_RE.sub("", s)
-    # remove leftover parentheses/brackets around removed links
     s = re.sub(r"\(\s*\)", "", s)
     s = re.sub(r"\[\s*\]", "", s)
-    # clean spaces
     s = re.sub(r"[ \t]{2,}", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
+def remove_preview_boilerplate(s: str) -> str:
+    # Removes common platform preview junk (esp. YouTube)
+    lines = [ln.strip() for ln in s.splitlines()]
+    cleaned = []
+    for ln in lines:
+        low = ln.lower()
+
+        if not ln:
+            cleaned.append("")
+            continue
+
+        # platform header lines
+        if low in {"youtube", "instagram", "facebook", "twitter", "x", "telegram"}:
+            continue
+
+        # common youtube boilerplate text
+        if "enjoy the videos and music you love" in low:
+            continue
+        if "upload original content" in low:
+            continue
+        if "share it all with friends" in low:
+            continue
+        if "and the world on youtube" in low:
+            continue
+        if "on youtube" in low and len(ln) < 80:
+            continue
+
+        # glued "YouTubeTitle..." lines
+        if low.startswith("youtube") and len(ln) > 6:
+            # remove starting "YouTube" word if it's just a prefix
+            ln2 = re.sub(r"(?i)^youtube\s*", "", ln).strip()
+            if ln2:
+                cleaned.append(ln2)
+            continue
+
+        cleaned.append(ln)
+
+    out = "\n".join(cleaned)
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    return out
+
 def normalize_for_compare(s: str) -> str:
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    return re.sub(r"\s+", " ", s).strip()
 
 def parse_first_item(xml: str):
     m_item = re.search(r"<item>(.*?)</item>", xml, flags=re.S)
@@ -79,7 +116,7 @@ def parse_first_item(xml: str):
     desc_raw = re.sub(r"<!\[CDATA\[|\]\]>", "", pick("description"))
     desc_html = html.unescape(desc_raw)
 
-    # Try to extract image URL
+    # Extract image URL if present
     img = None
     m_href = re.search(r'<a[^>]+href="([^"]+\.(?:jpg|jpeg|png|webp))"', desc_html, flags=re.I)
     if m_href:
@@ -95,32 +132,31 @@ def parse_first_item(xml: str):
     # remove "[Photo]" noise
     desc = re.sub(r"^\[Photo\]\s*", "", desc).strip()
 
-    # Remove links from both
+    # Remove links
     title = remove_links(title)
     desc = remove_links(desc)
 
-    # ✅ DEDUPE: if desc starts with title (or equal), keep only desc OR only title
+    # Remove preview boilerplate (YouTube etc.)
+    title = remove_preview_boilerplate(title)
+    desc = remove_preview_boilerplate(desc)
+
+    # ✅ DEDUPE title vs desc
     t_norm = normalize_for_compare(title)
     d_norm = normalize_for_compare(desc)
 
     if t_norm and d_norm:
         if d_norm == t_norm:
-            # same text in both
             combined = desc
         elif d_norm.startswith(t_norm):
-            # desc already contains title at start -> don't repeat
             combined = desc
         elif t_norm.startswith(d_norm):
-            # title contains desc -> use title
             combined = title
         else:
             combined = f"{title}\n\n{desc}"
     else:
         combined = title or desc
 
-    # Final cleanup
     combined = re.sub(r"\n{3,}", "\n\n", combined).strip()
-
     return {"guid": guid, "text": combined, "img": img}
 
 def main():
@@ -135,18 +171,16 @@ def main():
         print("No new post")
         return
 
-    caption_or_text = f"{item['text']}\n\n━━━━━━━━━━━━━━\n{FOLLOW_LINE}".strip()
-    caption_or_text = re.sub(r"\n{3,}", "\n\n", caption_or_text).strip()
+    out = f"{item['text']}\n\n━━━━━━━━━━━━━━\n{FOLLOW_LINE}".strip()
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
 
     if item["img"]:
-        # download & upload image (so image shows properly)
         img_resp = requests.get(item["img"], timeout=120)
         img_resp.raise_for_status()
-        # Telegram caption limit ~1024
-        cap = caption_or_text[:900]
+        cap = out[:900]  # safe under caption limit
         tg_photo_upload(img_resp.content, cap)
     else:
-        tg_send_text(caption_or_text)
+        tg_send_text(out)
 
     write_last(item["guid"])
     print("Posted:", item["guid"])
