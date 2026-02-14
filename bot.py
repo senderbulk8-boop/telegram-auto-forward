@@ -1,4 +1,4 @@
-import os, re, html
+import os, re, html, time
 import requests
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -7,21 +7,11 @@ FEED_URL = os.environ["FEED_URL"]
 FOLLOW_LINE = os.environ.get("FOLLOW_LINE", "📢 Follow @topgkguru")
 LAST_FILE = "last.txt"
 
-# remove any kinds of links
-URL_RE = re.compile(r"""(?ix)
-\b(
-  https?://\S+ |
-  www\.\S+ |
-  t\.me/\S+ |
-  telegram\.me/\S+
-)\b
-""")
+URL_RE = re.compile(r"""(?ix)\b(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+)\b""")
 
-# detect truncated endings like "[...]" or "..." or "…"
 TRUNC_END_RE = re.compile(r"""(?ix)
-(\s*\[\s*\.\.\.\s*\]\s*$) |
-(\s*\[\s*…\s*\]\s*$) |
-(\s*…\s*$) |
+(\s*\[\s*\.\.\.\s*\]\s*$)|
+(\s*…\s*$)|
 (\s*\.\.\.\s*$)
 """)
 
@@ -70,63 +60,49 @@ def normalize(s: str) -> str:
     return s
 
 def remove_prefixes(s: str) -> str:
-    # remove [Photo] / [Media] prefix if exists
-    s = re.sub(r"^\[(?:Photo|Media)\]\s*", "", s, flags=re.I).strip()
-    return s
+    return re.sub(r"^\[(?:Photo|Media)\]\s*", "", s, flags=re.I).strip()
 
-def parse_first_item(xml: str):
-    m_item = re.search(r"<item>(.*?)</item>", xml, flags=re.S)
-    if not m_item:
-        return None
-    item = m_item.group(1)
-
+def parse_item(item_xml: str):
     def pick(tag):
-        m = re.search(rf"<{tag}>(.*?)</{tag}>", item, flags=re.S)
+        m = re.search(rf"<{tag}>(.*?)</{tag}>", item_xml, flags=re.S)
         return (m.group(1).strip() if m else "")
 
-    # basic fields
     title_raw = re.sub(r"<!\[CDATA\[|\]\]>", "", pick("title"))
     desc_raw = re.sub(r"<!\[CDATA\[|\]\]>", "", pick("description"))
     link = pick("link").strip()
     guid = (pick("guid").strip() or link)
 
-    # enclosure (best for photos)
+    # enclosure for images
     enc_url = None
     enc_type = None
-    m_enc = re.search(r'enclosure[^>]+url="([^"]+)"[^>]+type="([^"]+)"', item, flags=re.I)
+    m_enc = re.search(r'enclosure[^>]+url="([^"]+)"[^>]+type="([^"]+)"', item_xml, flags=re.I)
     if m_enc:
         enc_url = m_enc.group(1)
         enc_type = m_enc.group(2)
 
     title = remove_prefixes(strip_tags(title_raw))
     desc = strip_tags(desc_raw)
-
-    # remove "[Photo]" text inside description too
     desc = re.sub(r"^\[Photo\]\s*", "", desc).strip()
 
-    # remove links everywhere
     title = remove_links(title)
     desc = remove_links(desc)
 
-    # --- DEDUPE FIX FOR YOUR FEED ---
-    # If title is truncated (ends with [...]/.../…), DO NOT include it at all.
+    # DEDUPE (handles truncated title like [...])
     title_is_truncated = bool(TRUNC_END_RE.search(title_raw)) or bool(TRUNC_END_RE.search(title))
     t_norm = normalize(title)
+
+    # first non-empty line of desc
+    first_line = ""
+    for ln in desc.splitlines():
+        if ln.strip():
+            first_line = ln.strip()
+            break
+    f_norm = normalize(first_line)
     d_norm = normalize(desc)
 
     if title_is_truncated:
         combined = desc
     else:
-        # If description already starts with title, drop title
-        # (your feed often repeats title inside description)
-        # Compare first line too
-        first_line = ""
-        for ln in desc.splitlines():
-            if ln.strip():
-                first_line = ln.strip()
-                break
-
-        f_norm = normalize(first_line)
         if t_norm and f_norm and (f_norm == t_norm or f_norm.startswith(t_norm) or t_norm.startswith(f_norm)):
             combined = desc
         elif t_norm and d_norm and (d_norm == t_norm or d_norm.startswith(t_norm)):
@@ -135,7 +111,6 @@ def parse_first_item(xml: str):
             combined = f"{title}\n\n{desc}".strip() if title and desc else (title or desc)
 
     combined = re.sub(r"\n{3,}", "\n\n", combined).strip()
-
     return {
         "guid": guid,
         "text": combined,
@@ -143,31 +118,51 @@ def parse_first_item(xml: str):
         "enclosure_type": enc_type
     }
 
-def main():
-    last = read_last()
-    xml = requests.get(FEED_URL, timeout=60).text
-    item = parse_first_item(xml)
+def parse_all_items(xml: str):
+    items = []
+    for m in re.finditer(r"<item>(.*?)</item>", xml, flags=re.S):
+        items.append(parse_item(m.group(1)))
+    return items
 
-    if not item:
+def main():
+    last_guid = read_last()
+
+    xml = requests.get(FEED_URL, timeout=60).text
+    items = parse_all_items(xml)
+    if not items:
         print("No items found")
         return
-    if item["guid"] == last:
-        print("No new post")
+
+    # RSS is newest-first. Collect all items until we hit last_guid.
+    new_items = []
+    for it in items:
+        if last_guid and it["guid"] == last_guid:
+            break
+        new_items.append(it)
+
+    if not new_items:
+        print("No new posts")
         return
 
-    out = f"🔥 New Update\n\n{item['text']}\n\n━━━━━━━━━━━━━━\n{FOLLOW_LINE}".strip()
-    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    # Send oldest -> newest so ordering stays correct
+    new_items.reverse()
 
-    # If image enclosure exists, send as real photo
-    if item["enclosure_url"] and item["enclosure_type"] and item["enclosure_type"].lower().startswith("image/"):
-        img = requests.get(item["enclosure_url"], timeout=120)
-        img.raise_for_status()
-        tg_send_photo_bytes(img.content, out)
-    else:
-        tg_send_text(out)
+    for it in new_items:
+        out = f"🔥 New Update\n\n{it['text']}\n\n━━━━━━━━━━━━━━\n{FOLLOW_LINE}".strip()
+        out = re.sub(r"\n{3,}", "\n\n", out).strip()
 
-    write_last(item["guid"])
-    print("Posted:", item["guid"])
+        if it["enclosure_url"] and it["enclosure_type"] and it["enclosure_type"].lower().startswith("image/"):
+            img = requests.get(it["enclosure_url"], timeout=120)
+            img.raise_for_status()
+            tg_send_photo_bytes(img.content, out)
+        else:
+            tg_send_text(out)
+
+        time.sleep(1)  # avoid Telegram rate limits
+
+    # Save newest guid as last processed
+    write_last(new_items[-1]["guid"])
+    print("Posted", len(new_items), "items. Last:", new_items[-1]["guid"])
 
 if __name__ == "__main__":
     main()
