@@ -155,7 +155,7 @@ def main():
         print("No new post")
         return
 
-    out = f"{item['text']}\n\n━━━━━━━━━━━━━━\n{FOLLOW_LINE}".strip()
+    out = f"🔥 New Update\n\n{item['text']}\n\n━━━━━━━━━━━━━━\n{FOLLOW_LINE}".strip()
     out = re.sub(r"\n{3,}", "\n\n", out).strip()
 
     # If image enclosure exists, send as real photo
